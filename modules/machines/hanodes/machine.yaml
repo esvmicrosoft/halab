@@ -1,0 +1,21 @@
+#cloud-config
+
+#bootcmd:
+#  - until [ -e /dev/disk/azure/scsi1/lun0 ]; do sleep 5; done
+
+packages:
+  - python3-azure-identity
+  - python3-azure-keyvault
+  - python3-azure-keyvault-administration
+  - python3-azure-keyvault-certificates
+  - python3-azure-keyvault-keys
+  - python3-azure-keyvault-nspkg
+  - python3-azure-keyvault-secrets
+  - python3-azure-mgmt-keyvault
+  - drbd
+  - drbd-kmp-default
+  - drbd-utils
+  - apache2
+
+
+

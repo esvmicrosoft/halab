@@ -1,0 +1,596 @@
+#cloud-config
+
+bootcmd:
+  - until [ -e /dev/disk/azure/scsi1/lun0 ]; do sleep 60; done
+
+
+
+package_upgrade: true
+packages:
+  - ansible-core
+  - python3-azure
+
+write_files:
+  - path: /root/bin/getkeys.py
+    encoding:  text/plain
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/python3
+      
+      
+      from azure.identity import ManagedIdentityCredential
+      from azure.keyvault.secrets import SecretClient
+      import socket
+      import os
+      import time
+      import logging
+      
+      logging.basicConfig(format='%(asctime)s %(message)s', filemode='w')
+      
+      logger = logging.getLogger()
+      logger.setLevel(logging.DEBUG)
+      
+      credential = ManagedIdentityCredential()
+      vaultname = socket.gethostname()
+      vault_url  = f'https://{vaultname}.vault.azure.net/'
+      
+      secrets = [
+        ["privkey", "/root/.ssh/id_rsa"],
+        ["privkey", "/root/privkey"],
+        ["pubkey",  "/root/pubkey"],
+      ]
+      
+      client = SecretClient(vault_url=vault_url, credential=credential)
+      for valuepair in secrets:
+          secret_name = valuepair[0]
+          filename    = valuepair[1]
+          logging.debug("Looking for secret %s", secret_name)
+          nosecret = True
+          i=0
+          while nosecret and i <= 5:
+              list_of_secrets = client.list_properties_of_secrets()
+              secrets_names = [ secret.name for secret in list_of_secrets ]
+              logging.debug("List of secrets returned by the vault %s", ' '.join(secrets_names))
+              if secret_name in secrets_names:
+                  nosecret = False
+              else:
+                  i = i+1
+                  time.sleep(20)
+      
+          logging.debug("Number of iterations had to wait to retrieve %s : %d",secret_name, i)
+          if i > 5:
+              logging.critical("Could not find secret %s", secret_name)
+              raise Exception("Secret not found or not populated on time!")
+      
+          logging.debug("trying to get %s secret", secret_name)
+          secret = client.get_secret(secret_name)
+          f = open(filename,"wt")
+          f.write(secret.value)
+          f.close()
+          os.chmod(filename,0o600)
+      
+      with open("/root/ansible/ansible_vars", "w") as ha_vars:
+         ha_vars.write("---\n")
+         for secret_name in [ "subscriptionid", "resourcegroup", "firstnode", "machineslist", "serviceip" ]:
+             logging.debug("Looking for secret %s", secret_name)
+             nosecret = True
+             i=0
+             while nosecret and i <= 5:
+                 list_of_secrets = client.list_properties_of_secrets()
+                 secrets_names = [ secret.name for secret in list_of_secrets ]
+                 logging.debug("List of secrets returned by the vault %s", ' '.join(secrets_names))
+                 if secret_name in secrets_names:
+                     nosecret = False
+                 else:
+                     i = i+1
+                     time.sleep(20)
+         
+             logging.debug("Number of iterations had to wait to retrieve %s : %d",secret_name, i)
+             if i > 5:
+                 logging.critical("Could not find secret %s", secret_name)
+                 raise Exception("Secret not found or not populated on time!")
+         
+             logging.debug("trying to get %s secret", secret_name)
+             secret = client.get_secret(secret_name)
+             ha_vars.write("{}: {}\n".format(secret_name,secret.value))
+      
+      with open("/root/ansible/hosts", "a") as hosts:
+          secret_name = "machineslist"
+          logging.debug("Looking for secret %s", secret_name)
+          nosecret = True
+          i=0
+          while nosecret and i <= 5:
+              list_of_secrets = client.list_properties_of_secrets()
+              secrets_names = [ secret.name for secret in list_of_secrets ]
+              logging.debug("List of secrets returned by the vault %s", ' '.join(secrets_names))
+              if secret_name in secrets_names:
+                  nosecret = False
+              else:
+                  i = i+1
+                  time.sleep(20)
+      
+          logging.debug("Number of iterations had to wait to retrieve %s : %d",secret_name, i)
+          if i > 5:
+              logging.critical("Could not find secret %s", secret_name)
+              raise Exception("Secret not found or not populated on time!")
+      
+          logging.debug("trying to get %s secret", secret_name)
+          secret = client.get_secret(secret_name)
+
+          # create the inventory file
+          machines = secret.value.split(',')
+
+          clients = '\n'.join(machines)
+          print(clients, file=hosts, sep='\n')
+
+          print('[controllers]', file=hosts, sep='\n')
+          print('\n'.join(machines[::2]), file=hosts, sep='\n')
+
+          i = 0
+          while i < len(machines)/2:
+            print(f'[group{i}]', file=hosts, sep='\n')
+            print('\n'.join(machines[i*2:i*2+2]), file=hosts, sep='\n')
+            groupvars = open(f"/root/ansible/group_vars/group{i}","w")
+            groupvars.write(f"mygroup: group{i}")
+            groupvars.close()
+            i = i + 1
+          
+
+  - path: /root/bin/ansible_playbook.sh
+    permissions: '0755'
+    owner: root:root
+    encoding:  text/plain
+    content: |
+      #!/usr/bin/bash
+      cd /root/ansible
+      ansible-playbook -i hosts ./ha_playbook.yml 
+
+  - path: /root/ansible/hosts
+    owner: root:root
+    encoding:  text/plain
+    content: |
+        [hanodes]
+
+  - path: /root/ansible/ansible.cfg
+    owner: root:root
+    encoding:  text/plain
+    content: |
+        [defaults]
+        inventory=/root/ansible/hosts
+        roles=/home/azureuser/halab/roles
+        remote_user = azureuser
+        host_key_checking = false
+        
+        [privilege_escalation]
+        become=true
+        become_method=sudo
+        become_user=root
+        become_ask_pass=false
+
+  - path: /root/ansible/group_vars/.empty
+    owner: root:root
+    encoding: text/plain
+
+  - path: /root/ansible/templates/global_common.conf 
+    owner: root:root
+    encoding: text/plain
+    content: | 
+       global {
+            usage-count no;
+       }
+       common {
+            handlers {
+                 fence-peer "/usr/lib/drbd/crm-fence-peer.9.sh";
+                 after-resync-target "/usr/lib/drbd/crm-unfence-peer.9.sh";
+                 split-brain "/usr/lib/drbd/notify-split-brain.sh root";
+                 pri-lost-after-sb "/usr/lib/drbd/notify-pri-lost-after-sb.sh; /usr/lib/drbd/notify-emergency-reboot.sh; echo b > /proc/sysrq-trigger ; reboot -f";
+            }
+            startup {
+                 wfc-timeout 0;
+                 # wfc-timeout 100;
+                 # degr-wfc-timeout 120;
+            }
+            options {
+            }
+            disk {
+                 md-flushes yes;
+                 disk-flushes yes;
+                 c-plan-ahead 1;
+                 c-min-rate 100M;
+                 c-fill-target 20M;
+                 c-max-rate 4G;
+            }
+            net {
+                 after-sb-0pri discard-younger-primary;
+                 after-sb-1pri discard-secondary;
+                 after-sb-2pri call-pri-lost-after-sb;
+                 protocol     C;
+                 tcp-cork yes;
+                 max-buffers 20000;
+                 max-epoch-size 20000;
+                 sndbuf-size 0;
+                 rcvbuf-size 0;
+            }
+       }
+
+
+  - path: /root/ansible/templates/r0.j2
+    owner: root:root
+    encoding: text/plain
+    content: |
+       resource r0 {
+         device /dev/drbd0;
+         disk /dev/disk/azure/scsi1/lun1;
+         meta-disk internal;
+
+         net {
+             fencing resource-and-stonith;
+         }
+         {% for host in groups[mygroup] | sort %}
+         on {{ host }} {
+           address {{ hostvars[host]['ansible_facts']['default_ipv4']['address'] -}}:7788;
+           node-id {{ loop.index-1 }};
+         }
+         {% endfor %}
+         disk {
+              on-io-error         detach;
+              resync-rate 10M;
+         }
+         connection-mesh {
+            hosts {%  for host in groups[mygroup] | sort %} {{ host -}}{% endfor %} ;
+         }
+       }
+
+  - path: /root/ansible/ha_playbook.yml
+    owner: root:root
+    encoding:  text/plain
+    content: |
+        ---
+        - name: Setup the HA attributes correctly
+          hosts: localhost
+          vars_files:
+            - /root/ansible/ansible_vars
+          tasks:
+          - name: load sshkeys from remote machines
+            ansible.builtin.shell:  "/usr/bin/ssh-keyscan -t rsa {{ item }} 2>/dev/null "
+            register: sshkeys
+            loop: "{{ groups['all'] }}"
+
+          - debug:
+              var:  sshkeys
+
+          - name: Store ssh host keys in hosts file
+            ansible.builtin.lineinfile:
+              path:   /root/.ssh/known_hosts
+              owner:   root
+              group:   root
+              mode:    '0600'
+              create:  true
+              state: present
+              line: "{{ item }}"
+            loop: "{{ sshkeys.results | map(attribute='stdout') }}"
+
+        - name: Setup the HA attributes correctly
+          hosts: all
+          vars_files:
+            - /root/ansible/ansible_vars
+          tasks:
+        
+          - name: create the sbd module file
+            ansible.builtin.copy:
+              dest:   /etc/modules-load.d/softdog.conf
+              owner:   root
+              group:   root
+              mode:    '0600'
+              content: |
+                softdog
+            notify:
+              - load module
+        
+          - name: Make sure /root/files exists
+            ansible.builtin.file:
+              path:   /root/hafiles
+              owner:   root
+              group:   root
+              state:   directory
+              mode:    '0700'
+        
+          - name: Create private key file for root user
+            ansible.builtin.copy:
+              src:   /root/privkey
+              dest:  /root/.ssh/id_rsa
+              mode:    '0600'
+              owner: root
+        
+          - name: Create public key file for root user
+            ansible.builtin.copy:
+              src:   /root/pubkey
+              dest:  /root/.ssh/id_rsa.pub
+              mode:  '0600'
+              owner: root
+                
+          - name: Create authorized_keys file for root user
+            ansible.builtin.copy:
+              src:   /root/pubkey
+              dest:  /root/.ssh/authorized_keys
+              mode:  '0600'
+              owner: root
+        
+          - name: Add the required attributes for sdb_pacemaker
+            ansible.builtin.lineinfile:
+              path: /etc/sysconfig/sbd
+              firstmatch: true
+              state:      present
+              regexp:     '^#*SBD_PACEMAKER=.*'
+              line:       'SBD_PACEMAKER=yes' 
+              owner:      'root'
+              group:      'root'
+              mode:       '0644'
+        
+          - name: Add the required attributes for sdb_startmode
+            ansible.builtin.lineinfile:
+              path: /etc/sysconfig/sbd
+              firstmatch: true
+              state:      present
+              regexp:     '^#*SBD_STARTMODE=.*'
+              line:       'SBD_STARTMODE=yes' 
+              owner:      'root'
+              group:      'root'
+              mode:       '0644'
+        
+          - name: load sshkeys from remote machines
+            ansible.builtin.shell:  
+              cmd: /usr/bin/ssh-keyscan -t rsa {{ item }} 2>/dev/null
+            register: sshkeys
+            with_items: [ "{{ groups[mygroup] }}"  ]
+        
+          - name: Make sure /root/.ssh directory exists
+            ansible.builtin.file:
+              path: /root/.ssh
+              owner: root
+              group: root
+              mode: '0700'
+              state: directory
+
+
+          - name: Store ssh host keys in hosts file
+            ansible.builtin.lineinfile:
+              path:   /root/.ssh/known_hosts
+              owner:   root
+              group:   root
+              mode:    '0600'
+              create:  true
+              state: present
+              line: "{{ item }}"
+            loop: "{{ sshkeys.results | map(attribute='stdout') }}"
+
+          - name: Configure /etc/drbd.d/global_common.conf
+            ansible.builtin.template:
+              src:  global_common.conf 
+              dest: /etc/drbd.d/global_common.conf
+              owner: root
+              group: root
+
+          - name: Resource r0 file
+            ansible.builtin.template:
+              src: r0.j2
+              dest: /etc/drbd.d/r0.res
+              owner: root
+              group: root
+
+          - name: Initialize DRBD
+            ansible.builtin.shell:
+              cmd:  "{{ item }}"
+              creates: "/data"
+            loop:
+            - "drbdadm create-md r0"
+            - "drbdadm up r0"
+            - "mkdir /data"
+
+          - name: Setup the Webserver config
+            ansible.builtin.lineinfile:
+              path: /etc/apache2/default-server.conf
+              firstmatch: true
+              state:      present
+              regexp:     "{{ item.pattern }}"
+              line:       "{{ item.text }}"
+            loop:
+            - { 'pattern': 'DocumentRoot ', 'text': 'DocumentRoot "/data/www/htdocs"' }
+            - { 'pattern': '<Directory "/srv/www/htdocs">', 'text': '<Directory "/data/www/htdocs">'}
+            - { 'pattern': '^ScriptAlias', 'text': 'ScriptAlias /cgi-bin/ "/data/cgi-bin/"' }
+            - { 'pattern': '<Directory "/srv/www/cgi-bin">', 'text': '<Directory "/data/cgi-bin">'}
+            - { 'pattern': '^ScriptAlias', 'text': 'ScriptAlias /cgi-bin/ "/data/cgi-bin/"' }
+
+          handlers:
+            - name: load module
+              ansible.builtin.command: modprobe softdog
+        
+        - name: Deploy Suse HA cluster
+          hosts: controllers
+          vars_files:
+            - /root/ansible/ansible_vars
+          tasks:
+          - name: Setup HA cluster  
+            include_tasks: tasks/cluster.yml
+
+          - name: Configure corosync.conf
+            ansible.builtin.lineinfile:
+              path: /etc/corosync/corosync.conf
+              state:      present
+              insertafter: '^\s*join:*' 
+              line:        '        consensus:    36000'
+            notify:
+              - restart corosync
+        
+          handlers:
+            - name: restart corosync
+              ansible.builtin.systemd:
+                name: corosync
+                state: restarted
+
+  - path: /root/ansible/tasks/cluster.yml 
+    owner: root:root
+    encoding:  text/plain
+    content: |
+      ---
+      - name: Initialize DRBD
+        ansible.builtin.shell:
+          cmd:  "{{ item }}"
+          creates: "/root/hafiles/drbd-use"
+        loop:
+        - "drbdadm new-current-uuid --clear-bitmap r0/0"
+        - "drbdadm primary --force r0"
+        - "mkfs.xfs /dev/drbd0"
+        - "mount /dev/drbd0 /data"
+        - "mkdir -p /data/www/htdocs"
+        - "mkdir -p /data/cgi-bin"
+        - "chown -R root:root /data"
+        - "chmod -R 0755 /data"
+        - "touch /root/hafiles/drbd-setup"
+        - "touch /root/hafiles/drbd-use"
+
+      - name: Check if cgi-bin directory exists
+        ansible.builtin.stat:
+          path: "/data/cgi-bin"
+        register: stat_cgibin
+
+      - name: Setup the Web structure
+        ansible.builtin.copy:
+          dest: "/data/cgi-bin/hostname.sh"
+          owner: "root"
+          group: "root"
+          mode: '0755'
+          content: |
+            #!/bin/sh
+            echo "Content-Type: text/html"
+            echo ""
+            echo "<html><head><title>Shell CGI script</title></head><body>"
+            echo "<h1>Shell CGI script</h1>"
+            echo "<p>The current directory is: `pwd`</p>"
+            echo "<p>The current user is: `whoami`</p>"
+            echo "<p>The current date is: `date`</p>"
+            echo "<p>The current hostname is: `uname -n`</p>"
+            echo "</body></html>"
+        when: stat_cgibin.stat.exists
+
+      - name: Unmount /data filesystem during config session
+        ansible.builtin.shell:
+          cmd:  "{{ item }}"
+          creates: "/root/hafiles/drbd-finale"
+        loop:
+        - "umount /data"
+        - "drbdadm secondary r0"
+        - "rm -f /root/hafiles/drbd-setup"
+        - "touch /root/hafiles/drbd-finale"
+
+      - name: Format sbd_device
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/sbd_device
+        loop:
+        - /usr/sbin/sbd -d /dev/disk/azure/scsi1/lun0 -1 60 -4 120 create > /root/hafiles/sbd_device
+        - touch /root/hafiles/sbd_device
+
+      - name: Confugure the HA cluster
+        ansible.builtin.shell:
+          cmd:  "{{ item }}"
+          creates: /root/hafiles/cluster_setup
+        loop:
+        - /usr/sbin/crm cluster init --nodes "{{ groups[mygroup] | join(',') }}"  -s /dev/disk/azure/scsi1/lun0  --yes
+        - touch /root/hafiles/cluster_setup
+
+      - name: Confugure fence agent with a Managed Identity
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/fence_agent
+        loop:
+        - crm configure primitive rsc_st_azure stonith:fence_azure_arm params msi=true subscriptionId="{{ subscriptionid }}" resourceGroup="{{ resourcegroup }}" pcmk_monitor_retries=4 pcmk_action_limit=3 power_timeout=240 pcmk_reboot_timeout=900 op monitor interval=3600 timeout=120
+        - touch /root/hafiles/fence_agent
+      - name: Azure Events agent
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/rsc_azure-events
+        loop:
+        - crm configure primitive rsc_azure-events ocf:heartbeat:azure-events op monitor interval=10s
+        - touch /root/hafiles/rsc_azure-events
+
+      - name: Azure Events agent clone
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/fence_agents-events_cluster
+        loop:
+        - crm configure clone cln_azure-events rsc_azure-events
+        - touch /root/hafiles/fence_agents-events_cluster
+
+      - name: Configure the DRBD resources
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/drbd_resource
+        loop:
+        - crm configure primitive drbd_r0 ocf:linbit:drbd params drbd_resource="r0" op monitor interval="15" role="Master" op monitor interval="30" role="Slave"
+        - crm configure ms ms-drbd_r0 drbd_r0 meta master-max="1" master-node-max="1" clone-max="2" clone-node-max="1" notify="true" interleave="true"
+        - crm configure primitive fs_data ocf:heartbeat:Filesystem params device=/dev/drbd0 directory=/data fstype=xfs op monitor interval="10s"
+        - touch /root/hafiles/drbd_resource
+
+      - name: Configure Primitive IP address
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/ipaddress
+        loop:
+        - crm configure primitive vip_address IPaddr2 params ip={{ serviceip }} op monitor interval=10 timeout=20
+        - touch /root/hafiles/ipaddress
+
+      - name: Configure the Load Balancer Network probe
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/azurelb_primitive
+        loop:
+        - crm configure primitive lbprobe azure-lb port=61000 op monitor timeout=20s interval=10
+        - touch /root/hafiles/azurelb_primitive
+
+      - name: Configure the Application service primitive
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/apache2.service
+        loop:
+        - crm configure primitive apache2_service systemd:apache2.service
+        - touch /root/hafiles/apache2.service
+
+      - name: Configure Resource Group
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/resource_group
+        loop:
+        - crm configure group apache_group fs_data vip_address apache2_service lbprobe
+        - touch  /root/hafiles/resource_group
+
+      - name: Configure order constraint
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/order_constraint
+        loop:
+        - 'crm configure order o-fs_data-before_apache inf: ms-drbd_r0:promote apache_group:start'
+        - touch /root/hafiles/order_constraint
+
+      - name: Configure colocation constraint
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/colocation_constraint
+        loop:
+        - 'crm configure colocation col-apache_fs_on_drbd inf: apache_group ms-drbd_r0:Master'
+        - touch /root/hafiles/colocation_constraint
+
+      - name: Confugure stonith-timeout
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/fence_agent
+        loop:
+        - crm configure property stonith-timeout=900
+        - crm configure rsc_defaults resource-stickness="200"
+        - touch /root/hafiles/stonith_timeout
+
+                
+runcmd:
+  - /usr/bin/python3 /root/bin/getkeys.py
+  - /usr/bin/bash /root/bin/ansible_playbook.sh
